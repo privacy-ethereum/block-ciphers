@@ -11,7 +11,22 @@
 //! We do NOT recommend using it to implement any algorithm which has not
 //! received extensive peer review by cryptographers.
 
+// On wasm32 with `simd128`, the SIMD-accelerated `fixslice128` *is* the
+// portable backend (no runtime CPU detection applies); bind `soft` to it so
+// the trailing fallback in each function below dispatches to SIMD directly.
+#[cfg(not(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    not(aes_backend = "soft"),
+)))]
 use crate::soft::fixslice::hazmat as soft;
+
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    not(aes_backend = "soft"),
+))]
+use crate::wasm32::hazmat as soft;
 
 pub use crate::Block;
 /// Eight 128-bit AES blocks

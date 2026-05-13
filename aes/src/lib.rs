@@ -130,6 +130,17 @@ pub mod hazmat;
 
 #[macro_use]
 mod macros;
+
+// On wasm32 with simd128, the soft backend is unreachable except via the
+// optional `hazmat` module, so its public types appear dead-coded.
+#[cfg_attr(
+    all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        not(aes_backend = "soft"),
+    ),
+    allow(dead_code)
+)]
 mod soft;
 
 cpubits::cfg_if! {
@@ -144,6 +155,13 @@ cpubits::cfg_if! {
         mod x86;
         mod autodetect;
         pub use autodetect::*;
+    } else if #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        not(aes_backend = "soft"),
+    ))] {
+        mod wasm32;
+        pub use wasm32::*;
     } else {
         pub use soft::*;
     }

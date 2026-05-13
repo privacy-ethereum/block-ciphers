@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+### Added
+- WebAssembly `simd128` backend (`fixslice128`) covering AES-128, AES-192 and
+  AES-256 encryption and decryption with `ParBlocksSize = U8`.
+
 ## 0.9.0 (2026-04-10)
 ### Changed
 - Bump `cipher` dependency to v0.5
