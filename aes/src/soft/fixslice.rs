@@ -77,6 +77,35 @@ pub(crate) trait Word:
 
     /// Unpack a bitsliced 8-row state slice into `Self::Blocks` output blocks.
     fn inv_bitslice(input: &[Self]) -> Array<Block, Self::Blocks>;
+
+    /// `(self.ror(d_high) & m_low) | (self.ror(d_low) & m_high)` for the
+    /// `rotate_rows_and_columns_*` compound used inside `mix_columns_*`. The
+    /// scalar default works for any `Word`. For widths where the two masks
+    /// align to byte boundaries (only `V128` so far) the compound degenerates
+    /// to a single byte-shuffle; the V128 impl overrides accordingly.
+    #[inline(always)]
+    fn rotate_rows_and_columns_1_1(self) -> Self {
+        (self.ror(Self::ror_distance(1, 1)) & Self::uniform_row(0x3f))
+            | (self.ror(Self::ror_distance(0, 1)) & Self::uniform_row(0xc0))
+    }
+
+    #[inline(always)]
+    fn rotate_rows_and_columns_1_2(self) -> Self {
+        (self.ror(Self::ror_distance(1, 2)) & Self::uniform_row(0x0f))
+            | (self.ror(Self::ror_distance(0, 2)) & Self::uniform_row(0xf0))
+    }
+
+    #[inline(always)]
+    fn rotate_rows_and_columns_1_3(self) -> Self {
+        (self.ror(Self::ror_distance(1, 3)) & Self::uniform_row(0x03))
+            | (self.ror(Self::ror_distance(0, 3)) & Self::uniform_row(0xfc))
+    }
+
+    #[inline(always)]
+    fn rotate_rows_and_columns_2_2(self) -> Self {
+        (self.ror(Self::ror_distance(2, 2)) & Self::uniform_row(0x0f))
+            | (self.ror(Self::ror_distance(1, 2)) & Self::uniform_row(0xf0))
+    }
 }
 
 /// Width-generic delta-swap pipeline shared by `bitslice` and `inv_bitslice`
@@ -1344,33 +1373,25 @@ fn rotate_rows_2<W: Word>(x: W) -> W {
 }
 
 #[inline(always)]
-#[rustfmt::skip]
 fn rotate_rows_and_columns_1_1<W: Word>(x: W) -> W {
-    (x.ror(W::ror_distance(1, 1)) & W::uniform_row(0x3f)) |
-    (x.ror(W::ror_distance(0, 1)) & W::uniform_row(0xc0))
+    x.rotate_rows_and_columns_1_1()
 }
 
 #[cfg(not(aes_backend_soft = "compact"))]
 #[inline(always)]
-#[rustfmt::skip]
 fn rotate_rows_and_columns_1_2<W: Word>(x: W) -> W {
-    (x.ror(W::ror_distance(1, 2)) & W::uniform_row(0x0f)) |
-    (x.ror(W::ror_distance(0, 2)) & W::uniform_row(0xf0))
+    x.rotate_rows_and_columns_1_2()
 }
 
 #[cfg(not(aes_backend_soft = "compact"))]
 #[inline(always)]
-#[rustfmt::skip]
 fn rotate_rows_and_columns_1_3<W: Word>(x: W) -> W {
-    (x.ror(W::ror_distance(1, 3)) & W::uniform_row(0x03)) |
-    (x.ror(W::ror_distance(0, 3)) & W::uniform_row(0xfc))
+    x.rotate_rows_and_columns_1_3()
 }
 
 #[inline(always)]
-#[rustfmt::skip]
 fn rotate_rows_and_columns_2_2<W: Word>(x: W) -> W {
-    (x.ror(W::ror_distance(2, 2)) & W::uniform_row(0x0f)) |
-    (x.ror(W::ror_distance(1, 2)) & W::uniform_row(0xf0))
+    x.rotate_rows_and_columns_2_2()
 }
 
 // =====================================================================
@@ -1610,6 +1631,563 @@ impl Word for u64 {
     }
 }
 
+/// Expand an 8-bit row pattern to a 32-bit row pattern by quadrupling each bit:
+/// input bit `i` becomes output bits `4i`, `4i+1`, `4i+2`, `4i+3`.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+const fn quad_bits(b: u8) -> u32 {
+    let x = b as u32;
+    // Spread the 8 bits to positions 0, 4, 8, ..., 28.
+    let x = (x | (x << 12)) & 0x000F_000F;
+    let x = (x | (x << 6)) & 0x0303_0303;
+    let x = (x | (x << 3)) & 0x1111_1111;
+    // Replicate each spread bit to fill its 4-bit nibble.
+    let x = x | (x << 1);
+    x | (x << 2)
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[allow(unsafe_code)]
+mod v128_impl {
+    use super::{Array, Block, Word, bitslice_swaps, quad_bits};
+    use cipher::consts::U8;
+    use core::arch::wasm32::{
+        i8x16_shl, i8x16_shuffle, u8x16_shr, u8x16_splat, u32x4_replace_lane, u32x4_splat, v128,
+        v128_and, v128_not, v128_or, v128_xor,
+    };
+    use core::ops::{
+        BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not, Shl, Shr,
+    };
+
+    /// Newtype over `v128` so we can satisfy the `Word` operator bounds.
+    /// `Blocks = U8`, `ROW_BITS = 32`: each state word holds 8 bitsliced AES
+    /// blocks (1024-bit state across 8 such words).
+    #[repr(transparent)]
+    #[derive(Copy, Clone)]
+    pub(crate) struct V128(pub(super) v128);
+
+    impl Default for V128 {
+        #[inline(always)]
+        fn default() -> Self {
+            V128(u8x16_splat(0))
+        }
+    }
+
+    impl BitAnd for V128 {
+        type Output = Self;
+        #[inline(always)]
+        fn bitand(self, rhs: Self) -> Self {
+            V128(v128_and(self.0, rhs.0))
+        }
+    }
+
+    impl BitAndAssign for V128 {
+        #[inline(always)]
+        fn bitand_assign(&mut self, rhs: Self) {
+            self.0 = v128_and(self.0, rhs.0);
+        }
+    }
+
+    impl BitOr for V128 {
+        type Output = Self;
+        #[inline(always)]
+        fn bitor(self, rhs: Self) -> Self {
+            V128(v128_or(self.0, rhs.0))
+        }
+    }
+
+    impl BitOrAssign for V128 {
+        #[inline(always)]
+        fn bitor_assign(&mut self, rhs: Self) {
+            self.0 = v128_or(self.0, rhs.0);
+        }
+    }
+
+    impl BitXor for V128 {
+        type Output = Self;
+        #[inline(always)]
+        fn bitxor(self, rhs: Self) -> Self {
+            V128(v128_xor(self.0, rhs.0))
+        }
+    }
+
+    impl BitXorAssign for V128 {
+        #[inline(always)]
+        fn bitxor_assign(&mut self, rhs: Self) {
+            self.0 = v128_xor(self.0, rhs.0);
+        }
+    }
+
+    impl Not for V128 {
+        type Output = Self;
+        #[inline(always)]
+        fn not(self) -> Self {
+            V128(v128_not(self.0))
+        }
+    }
+
+    #[cfg(feature = "zeroize")]
+    impl zeroize::Zeroize for V128 {
+        #[inline(always)]
+        fn zeroize(&mut self) {
+            self.0 = u8x16_splat(0);
+        }
+    }
+
+    // Whole-register shifts on `v128`. The closed set of shift amounts the
+    // algorithm uses is {1, 2, 4} (sub-byte, only ever applied to values
+    // masked into byte-lane patterns by `byte_repeat`) and {8, 16, 24} (the
+    // byte-aligned `QUARTER_ROW`, `HALF_ROW`, `3 * QUARTER_ROW`). For the
+    // sub-byte cases, a per-byte lane shift produces identical results to a
+    // full-register shift after the surrounding byte-aligned mask; for
+    // byte-aligned cases we use `i8x16_shuffle` against a zero vector.
+    impl Shl<u32> for V128 {
+        type Output = Self;
+        #[inline(always)]
+        fn shl(self, n: u32) -> Self {
+            match n {
+                1 | 2 | 4 => V128(i8x16_shl(self.0, n)),
+                8 => V128(i8x16_shuffle::<
+                    16,
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                >(self.0, u8x16_splat(0))),
+                16 => V128(i8x16_shuffle::<
+                    16,
+                    16,
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                >(self.0, u8x16_splat(0))),
+                24 => V128(i8x16_shuffle::<
+                    16,
+                    16,
+                    16,
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                >(self.0, u8x16_splat(0))),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    impl Shr<u32> for V128 {
+        type Output = Self;
+        #[inline(always)]
+        fn shr(self, n: u32) -> Self {
+            match n {
+                1 | 2 | 4 => V128(u8x16_shr(self.0, n)),
+                8 => V128(i8x16_shuffle::<
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    16,
+                >(self.0, u8x16_splat(0))),
+                16 => V128(i8x16_shuffle::<
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    16,
+                    16,
+                >(self.0, u8x16_splat(0))),
+                24 => V128(i8x16_shuffle::<
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    16,
+                    16,
+                    16,
+                >(self.0, u8x16_splat(0))),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    impl Word for V128 {
+        type Blocks = U8;
+
+        const ROW_BITS: u32 = 32;
+
+        #[inline(always)]
+        fn ror(self, n: u32) -> Self {
+            // All `ror_distance(rows, cols)` results are byte-multiples since
+            // `cols * QUARTER_ROW = cols * 8` and `rows * ROW_BITS = rows * 32`.
+            // Each arm is a single `i8x16_shuffle` byte rotate.
+            match n {
+                8 => V128(i8x16_shuffle::<
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    0,
+                >(self.0, self.0)),
+                16 => V128(i8x16_shuffle::<
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    0,
+                    1,
+                >(self.0, self.0)),
+                24 => V128(i8x16_shuffle::<
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    0,
+                    1,
+                    2,
+                >(self.0, self.0)),
+                32 => V128(i8x16_shuffle::<
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    0,
+                    1,
+                    2,
+                    3,
+                >(self.0, self.0)),
+                40 => V128(i8x16_shuffle::<
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                >(self.0, self.0)),
+                48 => V128(i8x16_shuffle::<
+                    6,
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                >(self.0, self.0)),
+                56 => V128(i8x16_shuffle::<
+                    7,
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                >(self.0, self.0)),
+                64 => V128(i8x16_shuffle::<
+                    8,
+                    9,
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                >(self.0, self.0)),
+                80 => V128(i8x16_shuffle::<
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9,
+                >(self.0, self.0)),
+                _ => unreachable!(),
+            }
+        }
+
+        #[inline(always)]
+        fn uniform_row(b: u8) -> Self {
+            V128(u32x4_splat(quad_bits(b)))
+        }
+
+        #[inline(always)]
+        fn pack_rows(r0: u8, r1: u8, r2: u8, r3: u8) -> Self {
+            let v = u32x4_splat(quad_bits(r0));
+            let v = u32x4_replace_lane::<1>(v, quad_bits(r1));
+            let v = u32x4_replace_lane::<2>(v, quad_bits(r2));
+            let v = u32x4_replace_lane::<3>(v, quad_bits(r3));
+            V128(v)
+        }
+
+        #[inline(always)]
+        fn byte_repeat(b: u8) -> Self {
+            V128(u8x16_splat(b))
+        }
+
+        // The four `rotate_rows_and_columns_*` operations on V128 fold into
+        // single byte-permutations: with `ROW_BITS = 32` the mask pairs used
+        // by the compound `(ror & m_lo) | (ror & m_hi)` are byte-aligned, so
+        // each result byte comes from a known input byte. One
+        // `i8x16.shuffle` replaces ~7 wasm ops (two rotates, two const
+        // materializations, two ANDs, one OR) — and LLVM does not collapse
+        // the compound on its own, leaving meaningful work for SpiderMonkey
+        // in particular (which lowers `(a & m) | (b & ~m)` to three native
+        // instructions rather than recognizing it as `vpblendvb`).
+
+        #[inline(always)]
+        fn rotate_rows_and_columns_1_1(self) -> Self {
+            V128(i8x16_shuffle::<
+                5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12, 1, 2, 3, 0,
+            >(self.0, self.0))
+        }
+
+        #[inline(always)]
+        fn rotate_rows_and_columns_1_2(self) -> Self {
+            V128(i8x16_shuffle::<
+                6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13, 2, 3, 0, 1,
+            >(self.0, self.0))
+        }
+
+        #[inline(always)]
+        fn rotate_rows_and_columns_1_3(self) -> Self {
+            V128(i8x16_shuffle::<
+                7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14, 3, 0, 1, 2,
+            >(self.0, self.0))
+        }
+
+        #[inline(always)]
+        fn rotate_rows_and_columns_2_2(self) -> Self {
+            V128(i8x16_shuffle::<
+                10, 11, 8, 9, 14, 15, 12, 13, 2, 3, 0, 1, 6, 7, 4, 5,
+            >(self.0, self.0))
+        }
+
+        /// Bitslice eight 128-bit input blocks into a 1024-bit internal state.
+        ///
+        /// AES bytes are column-major within a block (byte at offset
+        /// `4*col + row`). The state word's pre-`bitslice_swaps` byte ordering
+        /// is row-major (byte at position `4*row + col`), so each block's 16
+        /// bytes are loaded via a single 4×4 transpose shuffle.
+        #[inline(always)]
+        fn bitslice(output: &mut [Self], input: &Array<Block, U8>) {
+            debug_assert_eq!(output.len(), 8);
+
+            #[inline(always)]
+            fn read_transposed(block: &Block) -> v128 {
+                let raw = v128_load(block.as_slice());
+                i8x16_shuffle::<0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15>(raw, raw)
+            }
+
+            let mut t = [
+                V128(read_transposed(&input[0])),
+                V128(read_transposed(&input[1])),
+                V128(read_transposed(&input[2])),
+                V128(read_transposed(&input[3])),
+                V128(read_transposed(&input[4])),
+                V128(read_transposed(&input[5])),
+                V128(read_transposed(&input[6])),
+                V128(read_transposed(&input[7])),
+            ];
+
+            bitslice_swaps(&mut t);
+
+            output[..8].copy_from_slice(&t);
+        }
+
+        /// Un-bitslice a 1024-bit internal state into eight 128-bit blocks.
+        #[inline(always)]
+        fn inv_bitslice(input: &[Self]) -> Array<Block, U8> {
+            debug_assert_eq!(input.len(), 8);
+
+            let mut t = [
+                input[0], input[1], input[2], input[3], input[4], input[5], input[6], input[7],
+            ];
+
+            bitslice_swaps(&mut t);
+
+            #[inline(always)]
+            fn write_transposed(state_word: v128, block: &mut Block) {
+                // The 4×4 transpose is its own inverse.
+                let raw = i8x16_shuffle::<0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15>(
+                    state_word, state_word,
+                );
+                v128_store(block.as_mut_slice(), raw);
+            }
+
+            let mut output = Array::<Block, U8>::default();
+            for (state_word, out_block) in t.iter().zip(output.iter_mut()) {
+                write_transposed(state_word.0, out_block);
+            }
+            output
+        }
+    }
+
+    /// Unaligned 128-bit load from a byte slice.
+    #[inline(always)]
+    fn v128_load(src: &[u8]) -> v128 {
+        debug_assert_eq!(src.len(), 16);
+        // SAFETY: `src` is asserted to have length 16; v128 has no alignment
+        // requirement (the wasm `v128.load` instruction supports unaligned
+        // access).
+        unsafe { core::ptr::read_unaligned(src.as_ptr() as *const v128) }
+    }
+
+    /// Unaligned 128-bit store to a byte slice.
+    #[inline(always)]
+    fn v128_store(dst: &mut [u8], val: v128) {
+        debug_assert_eq!(dst.len(), 16);
+        // SAFETY: `dst` is asserted to have length 16; v128 has no alignment
+        // requirement.
+        unsafe { core::ptr::write_unaligned(dst.as_mut_ptr() as *mut v128, val) }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+pub(crate) use v128_impl::V128;
+
 // =====================================================================
 // Concrete re-exports consumed by `soft.rs`
 //
@@ -1617,6 +2195,10 @@ impl Word for u64 {
 // `target_pointer_width`: `u32` on 16/32-bit targets, `u64` on 64-bit.
 // =====================================================================
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+type NativeWord = V128;
+
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 cpubits::cpubits! {
     16 | 32 => {
         type NativeWord = u32;
@@ -1840,4 +2422,3 @@ fn inv_bitslice_one<W: Word>(block: &mut Block, state: &State<W>) {
     let out = W::inv_bitslice(state);
     block.copy_from_slice(out[0].as_slice());
 }
-
